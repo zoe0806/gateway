@@ -22,6 +22,13 @@ type SimpleLoadBalancer struct {
 	counter uint64
 }
 
+var DefaultTransport = &http.Transport{
+	MaxIdleConns:        100, // 全局最大空闲连接
+	MaxIdleConnsPerHost: 10,  // 每个后端 host 最大空闲连接
+	IdleConnTimeout:     90 * time.Second,
+	DisableKeepAlives:   false, // 开启 Keep-Alive
+}
+
 func NewSimpleLoadBalancer(targets []string) *SimpleLoadBalancer {
 	return &SimpleLoadBalancer{targets: targets}
 }
@@ -53,9 +60,9 @@ func NewChatLogic(ctx context.Context, svcCtx *tools.ServiceContext) *ChatLogic 
 		limiters[api.Name] = rate.NewLimiter(10, 20)
 		breakers[api.Name] = gobreaker.NewCircuitBreaker(gobreaker.Settings{
 			Name:        api.Name,
-			MaxRequests: 3,
+			MaxRequests: 5,
 			Interval:    0,
-			Timeout:     10,
+			Timeout:     10 * time.Second,
 		})
 		apiKeys[api.Name] = api.ApiKey
 	}
@@ -92,23 +99,26 @@ func (l *ChatLogic) callBackend(backendName, url string, model string, messages 
 	if !ok {
 		breaker = gobreaker.NewCircuitBreaker(gobreaker.Settings{
 			Name:        backendName,
-			MaxRequests: 3,
+			MaxRequests: 5,
 			Interval:    0,
-			Timeout:     10,
+			Timeout:     10 * time.Second,
 			ReadyToTrip: func(counts gobreaker.Counts) bool {
 				failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-				return counts.Requests >= 3 && failureRatio >= 0.6
+				return counts.Requests >= 5 && failureRatio >= 0.6
 			},
 		})
 		l.breakers[backendName] = breaker
 	}
-	log.Printf("callBackend breaker: %+v, %t", breaker, ok)
+	//log.Printf("callBackend breaker: %+v, %t", breaker, ok)
 	// 熔断器内执行请求
 	result, err := breaker.Execute(func() (interface{}, error) {
 		// 创建客户端配置，指向DeepSeek的端点
 		config := openai.DefaultConfig(l.apiKeys[backendName])
 		config.BaseURL = url
-
+		config.HTTPClient = &http.Client{
+			Transport: DefaultTransport,
+			Timeout:   60 * time.Second,
+		}
 		client := openai.NewClientWithConfig(config)
 
 		// 构建请求参数，与OpenAI完全一致
@@ -166,7 +176,7 @@ func (l *ChatLogic) Chat(req *tools.Request) (*tools.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("selectBackend: %s, req: %+v", backend, req)
+	//log.Printf("selectBackend: %s, req: %+v", backend, req)
 
 	// 2. 限流
 	limiter, ok := l.limiters[backend]
