@@ -30,7 +30,10 @@ func main() {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-
+		if !tools.IsAllowedApiKey(req.ApiKey) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			return
+		}
 		chatLogic := logic.NewChatLogic(c.Request.Context(), serCtx)
 		resp, err := chatLogic.Chat(&req)
 		if err != nil {
@@ -50,6 +53,7 @@ func main() {
 		WriteTimeout:   60 * time.Second,
 		IdleTimeout:    120 * time.Second,
 		MaxHeaderBytes: 1 << 20, // 1MB
+
 	}
 	for {
 		select {

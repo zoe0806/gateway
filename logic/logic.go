@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gateway/config"
 	"gateway/tools"
 
 	"github.com/sashabaranov/go-openai"
@@ -16,136 +17,210 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// SimpleLoadBalancer 轮询负载均衡
-type SimpleLoadBalancer struct {
-	targets []string
-	counter uint64
-}
-
 var DefaultTransport = &http.Transport{
-	MaxIdleConns:        100, // 全局最大空闲连接
-	MaxIdleConnsPerHost: 10,  // 每个后端 host 最大空闲连接
+	MaxIdleConns:        100,
+	MaxIdleConnsPerHost: 10,
 	IdleConnTimeout:     90 * time.Second,
-	DisableKeepAlives:   false, // 开启 Keep-Alive
+	DisableKeepAlives:   false,
 }
 
-func NewSimpleLoadBalancer(targets []string) *SimpleLoadBalancer {
-	return &SimpleLoadBalancer{targets: targets}
+// SimpleLoadBalancer 同一后端多实例时按轮询选取。
+type SimpleLoadBalancer struct {
+	instances []config.Api
+	counter   uint64
 }
 
-func (lb *SimpleLoadBalancer) Next() string {
-	n := atomic.AddUint64(&lb.counter, 1) % uint64(len(lb.targets))
-	return lb.targets[n]
+func NewSimpleLoadBalancer(instances []config.Api) *SimpleLoadBalancer {
+	return &SimpleLoadBalancer{instances: instances}
+}
+
+func (lb *SimpleLoadBalancer) Next() config.Api {
+	if len(lb.instances) == 0 {
+		return config.Api{}
+	}
+	n := atomic.AddUint64(&lb.counter, 1) % uint64(len(lb.instances))
+	return lb.instances[n]
+}
+
+func (lb *SimpleLoadBalancer) Len() int {
+	if lb == nil {
+		return 0
+	}
+	return len(lb.instances)
 }
 
 type ChatLogic struct {
 	ctx        context.Context
 	svcCtx     *tools.ServiceContext
-	lb         *SimpleLoadBalancer
+	lbByName   map[string]*SimpleLoadBalancer
 	limiters   map[string]*rate.Limiter
-	breakers   map[string]*gobreaker.CircuitBreaker
-	apiKeys    map[string]string
-	httpClient *http.Client // 复用 HTTP 客户端
+	breakers   map[string]*gobreaker.CircuitBreaker // key: backend|url
+	httpClient *http.Client
+}
+
+func expandAPISpecs(apis []config.Api) []config.Api {
+	var out []config.Api
+	for _, a := range apis {
+		if len(a.Urls) > 0 {
+			for _, u := range a.Urls {
+				u = strings.TrimSpace(u)
+				if u == "" {
+					continue
+				}
+				one := a
+				one.Url = u
+				one.Urls = nil
+				out = append(out, one)
+			}
+			continue
+		}
+		if strings.TrimSpace(a.Url) != "" {
+			one := a
+			one.Urls = nil
+			out = append(out, one)
+		}
+	}
+	return out
+}
+
+func groupApisByName(instances []config.Api) map[string][]config.Api {
+	m := make(map[string][]config.Api)
+	for _, a := range instances {
+		name := strings.TrimSpace(a.Name)
+		if name == "" {
+			continue
+		}
+		m[name] = append(m[name], a)
+	}
+	return m
+}
+
+func circuitKey(backendName, url string) string {
+	return backendName + "|" + url
 }
 
 func NewChatLogic(ctx context.Context, svcCtx *tools.ServiceContext) *ChatLogic {
+	flat := expandAPISpecs(svcCtx.Config.Apis)
+	grouped := groupApisByName(flat)
 
-	var targets []string
 	limiters := make(map[string]*rate.Limiter)
 	breakers := make(map[string]*gobreaker.CircuitBreaker)
-	apiKeys := make(map[string]string)
+	lbByName := make(map[string]*SimpleLoadBalancer)
 
-	for _, api := range svcCtx.Config.Apis {
-		targets = append(targets, api.Url)
-		limiters[api.Name] = rate.NewLimiter(10, 20)
-		breakers[api.Name] = gobreaker.NewCircuitBreaker(gobreaker.Settings{
-			Name:        api.Name,
-			MaxRequests: 5,
-			Interval:    0,
-			Timeout:     10 * time.Second,
-		})
-		apiKeys[api.Name] = api.ApiKey
+	for name, insts := range grouped {
+		lbByName[name] = NewSimpleLoadBalancer(insts)
+		limiters[name] = rate.NewLimiter(10, 20)
+		for _, inst := range insts {
+			key := circuitKey(name, inst.Url)
+			if _, ok := breakers[key]; ok {
+				continue
+			}
+			breakers[key] = gobreaker.NewCircuitBreaker(gobreaker.Settings{
+				Name:        key,
+				MaxRequests: 5,
+				Interval:    0,
+				Timeout:     10 * time.Second,
+			})
+		}
 	}
-	lb := NewSimpleLoadBalancer(targets)
+
 	return &ChatLogic{
 		ctx:        ctx,
 		svcCtx:     svcCtx,
-		lb:         lb,
+		lbByName:   lbByName,
 		limiters:   limiters,
 		breakers:   breakers,
-		apiKeys:    apiKeys,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
+func (l *ChatLogic) hasBackend(name string) bool {
+	lb, ok := l.lbByName[name]
+	return ok && lb != nil && lb.Len() > 0
+}
+
 func (l *ChatLogic) selectBackend(model string) (string, error) {
 	switch {
-	case strings.Contains(model, "gpt"):
+	case strings.Contains(strings.ToLower(model), "gpt"):
 		return "openai", nil
-	case strings.Contains(model, "deepseek"):
+	case strings.Contains(strings.ToLower(model), "deepseek"):
 		return "deepseek", nil
-	case strings.Contains(model, "gemini"):
+	case strings.Contains(strings.ToLower(model), "gemini"):
 		return "gemini", nil
 	default:
 		return "", fmt.Errorf("unsupported model: %s", model)
 	}
 }
 
-// callBackend 发送真实 HTTP 请求，并解析响应为 tools.Response
-func (l *ChatLogic) callBackend(backendName, url string, model string, messages []tools.Message) (*tools.Response, error) {
-	log.Printf("callBackend: %s, baseURL: %s, model: %s, messages: %+v", backendName, url, model, messages)
-	// 获取或创建熔断器
-	breaker, ok := l.breakers[backendName]
+func (l *ChatLogic) callBackend(backendName, model string, messages []tools.Message) (*tools.Response, error) {
+	lb, ok := l.lbByName[backendName]
+	if !ok || lb.Len() == 0 {
+		return nil, fmt.Errorf("backend %q not configured", backendName)
+	}
+
+	apiCfg := lb.Next()
+	if strings.TrimSpace(apiCfg.Url) == "" {
+		return nil, fmt.Errorf("backend %q has no valid url", backendName)
+	}
+
+	chars := 0
+	for _, m := range messages {
+		chars += len(m.Content)
+	}
+	log.Printf("callBackend: backend=%s url=%s model=%s messages=%d approxChars=%d", backendName, apiCfg.Url, model, len(messages), chars)
+
+	bKey := circuitKey(backendName, apiCfg.Url)
+	breaker, ok := l.breakers[bKey]
 	if !ok {
 		breaker = gobreaker.NewCircuitBreaker(gobreaker.Settings{
-			Name:        backendName,
+			Name:        bKey,
 			MaxRequests: 5,
 			Interval:    0,
 			Timeout:     10 * time.Second,
 			ReadyToTrip: func(counts gobreaker.Counts) bool {
+				if counts.Requests == 0 {
+					return false
+				}
 				failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
 				return counts.Requests >= 5 && failureRatio >= 0.6
 			},
 		})
-		l.breakers[backendName] = breaker
+		l.breakers[bKey] = breaker
 	}
-	//log.Printf("callBackend breaker: %+v, %t", breaker, ok)
-	// 熔断器内执行请求
+
 	result, err := breaker.Execute(func() (interface{}, error) {
-		// 创建客户端配置，指向DeepSeek的端点
-		config := openai.DefaultConfig(l.apiKeys[backendName])
-		config.BaseURL = url
-		config.HTTPClient = &http.Client{
+		cfg := openai.DefaultConfig(apiCfg.ApiKey)
+		cfg.BaseURL = apiCfg.Url
+		cfg.HTTPClient = &http.Client{
 			Transport: DefaultTransport,
 			Timeout:   60 * time.Second,
 		}
-		client := openai.NewClientWithConfig(config)
+		client := openai.NewClientWithConfig(cfg)
 
-		// 构建请求参数，与OpenAI完全一致
+		oMsgs := make([]openai.ChatCompletionMessage, 0, len(messages))
+		for _, m := range messages {
+			oMsgs = append(oMsgs, openai.ChatCompletionMessage{
+				Role:    m.Role,
+				Content: m.Content,
+			})
+		}
+
 		req := openai.ChatCompletionRequest{
-			Model: model,
-			Messages: []openai.ChatCompletionMessage{
-				{
-					Role:    messages[0].Role,
-					Content: messages[0].Content,
-				},
-			},
+			Model:       model,
+			Messages:    oMsgs,
 			Stream:      false,
 			MaxTokens:   2048,
 			Temperature: 0.7,
 		}
 
-		// 发起调用
 		ctx := context.Background()
 		resp, err := client.CreateChatCompletion(ctx, req)
 		if err != nil {
-			fmt.Printf("Error: %v\n", err)
 			return nil, err
 		}
 
-		// 打印回复内容
-		if len(resp.Choices) > 0 {
-			fmt.Printf("回复: %s\n", resp.Choices[0].Message.Content)
+		if len(resp.Choices) == 0 {
+			return nil, fmt.Errorf("empty choices from upstream")
 		}
 
 		return &tools.Response{
@@ -171,21 +246,20 @@ func (l *ChatLogic) callBackend(backendName, url string, model string, messages 
 }
 
 func (l *ChatLogic) Chat(req *tools.Request) (*tools.Response, error) {
-	// 1. 选择后端
-	backend, err := l.selectBackend(req.Model)
+	route, err := l.resolveRoute(req)
 	if err != nil {
 		return nil, err
 	}
-	//log.Printf("selectBackend: %s, req: %+v", backend, req)
 
-	// 2. 限流
-	limiter, ok := l.limiters[backend]
+	pc := l.effectivePromptCompress()
+	msgs := CompressMessages(req.Messages, pc)
+
+	limiter, ok := l.limiters[route.Backend]
 	if !ok {
 		limiter = rate.NewLimiter(5, 10)
 	}
 	if !limiter.Allow() {
-		// 降级响应
-		log.Printf("rate_limit: %s", backend)
+		log.Printf("rate_limit: %s", route.Backend)
 		return &tools.Response{
 			Id:     "fallback",
 			Object: "error",
@@ -202,21 +276,13 @@ func (l *ChatLogic) Chat(req *tools.Request) (*tools.Response, error) {
 		}, nil
 	}
 
-	// 3. 负载均衡：选取一个实例（简化：同一个 backend 只有一个 baseURL）
-	baseURL := l.lb.Next()
-	log.Printf("loadBalancer: %s", baseURL)
-
-	// 5. 熔断调用
-	resp, err := l.callBackend(backend, baseURL, req.Model, req.Messages)
+	resp, err := l.callBackend(route.Backend, route.Model, msgs)
 	if err != nil {
 		log.Printf("callBackend failed: %s", err)
-		// 可以在这里做降级或记录错误
 		return nil, fmt.Errorf("backend call failed: %w", err)
 	}
 
-	// 6. 记录审计（可改用结构化日志）
-	// 注意：因为 resp 是指针，这里打印可能导致数据较大，生产环境请谨慎
-	log.Printf("Chat: backend=%s, baseURL=%s, req_model=%s, resp_id=%s", backend, baseURL, req.Model, resp.Id)
+	log.Printf("Chat: backend=%s economy=%t routed_model=%s client_model=%s resp_id=%s", route.Backend, route.Economy, route.Model, req.Model, resp.Id)
 
 	return resp, nil
 }

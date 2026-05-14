@@ -13,16 +13,37 @@ type Config struct {
 		Host string `json:"host"`
 		Key  string `json:"key"`
 	} `json:"consul"`
-	Port int    `json:"port"`
-	Host string `json:"host"`
-	Mode string `json:"mode"`
-	Apis []Api  `json:"apis"`
+	Port           int                 `json:"port"`
+	Host           string              `json:"host"`
+	Mode           string              `json:"mode"`
+	Apis           []Api               `json:"apis"`
+	Routing        RoutingConfig       `json:"routing"`
+	PromptCompress PromptCompressConfig `json:"prompt_compress"`
+}
+
+// RoutingConfig 智能模型路由：简单对话走经济模型，复杂任务保留客户端指定模型。
+type RoutingConfig struct {
+	Enabled           bool     `json:"enabled"`
+	EconomyModel      string   `json:"economy_model"`
+	EconomyBackend    string   `json:"economy_backend"`
+	MaxCharsSimple    int      `json:"max_chars_simple"`
+	MaxMessagesSimple int      `json:"max_messages_simple"`
+	ComplexKeywords   []string `json:"complex_keywords"`
+}
+
+// PromptCompressConfig 在发往上游前压缩上下文，降低 token 成本。
+type PromptCompressConfig struct {
+	Enabled            bool `json:"enabled"`
+	MaxTotalChars      int  `json:"max_total_chars"`
+	MaxMessageChars    int  `json:"max_message_chars"`
+	CollapseBlankLines bool `json:"collapse_blank_lines"`
 }
 
 type Api struct {
-	Name   string `json:"name"`
-	Url    string `json:"url"`
-	ApiKey string `json:"api_key"`
+	Name   string   `json:"name"`
+	Url    string   `json:"url"`
+	Urls   []string `json:"urls,omitempty"` // 与 url 二选一或并存：展开为多个实例（同一 name 多地址）
+	ApiKey string   `json:"api_key"`
 }
 
 var config Config

@@ -1,8 +1,11 @@
 package tools
 
 type Request struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
+	ApiKey string `json:"api_key"`
+	Model  string `json:"model"`
+	// RoutingMode: 空或 "auto" 按网关策略；"economy" 强制经济模型；"premium" 强制使用 Model 字段。
+	RoutingMode string    `json:"routing_mode,omitempty"`
+	Messages    []Message `json:"messages"`
 }
 
 type Message struct {

@@ -7,6 +7,7 @@ require (
 	github.com/hashicorp/consul/api v1.27.0
 	github.com/sashabaranov/go-openai v1.41.2
 	github.com/sony/gobreaker v1.0.0
+	golang.org/x/net v0.51.0
 	golang.org/x/time v0.15.0
 )
 
@@ -50,7 +51,6 @@ require (
 	golang.org/x/arch v0.22.0 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/exp v0.0.0-20230817173708-d852ddb80c63 // indirect
-	golang.org/x/net v0.51.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
