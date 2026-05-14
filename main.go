@@ -1,28 +1,34 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"gateway/tools"
-	"net/http"
-
 	"gateway/config"
 	"gateway/logic"
-
+	"gateway/tools"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"golang.org/x/net/context"
 )
 
 func main() {
-
 	cfg := config.Load()
 	serCtx := tools.NewServiceContext(*cfg)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+
+	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	router := gin.Default()
 	gin.SetMode(cfg.Mode)
+
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
 
 	router.POST("/chat", func(c *gin.Context) {
 		var req tools.Request
@@ -43,27 +49,28 @@ func main() {
 		c.JSON(http.StatusOK, resp)
 	})
 
-	// 假设配置的端口为 8080
 	addr := fmt.Sprintf(":%d", cfg.Port)
-	fmt.Printf("Starting server on %s\n", addr)
+	log.Printf("listening on %s", addr)
 	srv := &http.Server{
 		Addr:           addr,
 		Handler:        router,
 		ReadTimeout:    5 * time.Second,
 		WriteTimeout:   60 * time.Second,
 		IdleTimeout:    120 * time.Second,
-		MaxHeaderBytes: 1 << 20, // 1MB
+		MaxHeaderBytes: 1 << 20,
+	}
 
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			srv.Shutdown(ctx)
-			return
-		default:
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				panic(fmt.Errorf("listen and serve: %v", err))
-			}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen and serve: %v", err)
 		}
+	}()
+
+	<-rootCtx.Done()
+	shCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shCtx); err != nil {
+		log.Printf("server shutdown: %v", err)
 	}
+	serCtx.DeregisterFromConsul()
 }
