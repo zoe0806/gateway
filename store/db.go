@@ -21,7 +21,7 @@ func NewMySQL(cfg config.MySQLConfig) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.AutoMigrate(&model.APIKey{}); err != nil {
+	if err := db.AutoMigrate(&model.APIKey{}, &model.UsageLog{}); err != nil {
 		return nil, err
 	}
 	if err := seedAPIKeys(db); err != nil {

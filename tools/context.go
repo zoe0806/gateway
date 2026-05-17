@@ -17,6 +17,8 @@ type ServiceContext struct {
 	DB     *gorm.DB
 	Redis  *redis.Client
 	Auth   *auth.Authenticator
+	Usage  *store.UsageRecorder
+	Sticky *store.StickySession
 }
 
 func NewServiceContext(c config.Config) *ServiceContext {
@@ -40,6 +42,8 @@ func NewServiceContext(c config.Config) *ServiceContext {
 		DB:     db,
 		Redis:  rdb,
 		Auth:   authenticator,
+		Usage:  store.NewUsageRecorder(db),
+		Sticky: store.NewStickySession(rdb, c.StickySession),
 	}
 }
 

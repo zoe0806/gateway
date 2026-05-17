@@ -12,11 +12,20 @@ type Config struct {
 	Port           int                  `json:"port"`
 	Mode           string               `json:"mode"`
 	Apis           []Api                `json:"apis"`
+	ModelMap       map[string]ModelRoute `json:"model_map"`
 	Routing        RoutingConfig        `json:"routing"`
 	PromptCompress PromptCompressConfig `json:"prompt_compress"`
 	MySQL          MySQLConfig          `json:"mysql"`
 	Redis          RedisConfig          `json:"redis"`
 	Gateway        GatewayConfig        `json:"gateway"`
+	StickySession  StickySessionConfig  `json:"sticky_session"`
+	Concurrency    ConcurrencyConfig    `json:"concurrency"`
+}
+
+// ModelRoute 客户端 model -> 后端与上游 model。
+type ModelRoute struct {
+	Backend  string `json:"backend"`
+	Upstream string `json:"upstream,omitempty"`
 }
 
 type MySQLConfig struct {
@@ -28,10 +37,10 @@ type MySQLConfig struct {
 }
 
 type RedisConfig struct {
-	Addr             string `json:"addr"`
-	Password         string `json:"password"`
-	DB               int    `json:"db"`
-	APIKeyCacheTTL   int    `json:"api_key_cache_ttl_sec"`
+	Addr           string `json:"addr"`
+	Password       string `json:"password"`
+	DB             int    `json:"db"`
+	APIKeyCacheTTL int    `json:"api_key_cache_ttl_sec"`
 }
 
 type GatewayConfig struct {
@@ -42,7 +51,17 @@ type GatewayConfig struct {
 	FailoverMaxTries   int `json:"failover_max_tries"`
 }
 
-// RoutingConfig 智能模型路由：简单对话走经济模型，复杂任务保留客户端指定模型。
+type StickySessionConfig struct {
+	Enabled bool `json:"enabled"`
+	TTLSec  int  `json:"ttl_sec"`
+}
+
+type ConcurrencyConfig struct {
+	Enabled      bool `json:"enabled"`
+	GlobalMax    int  `json:"global_max"`
+	PerAPIKeyMax int  `json:"per_api_key_max"`
+}
+
 type RoutingConfig struct {
 	Enabled           bool     `json:"enabled"`
 	EconomyModel      string   `json:"economy_model"`
@@ -52,7 +71,6 @@ type RoutingConfig struct {
 	ComplexKeywords   []string `json:"complex_keywords"`
 }
 
-// PromptCompressConfig 在发往上游前压缩上下文，降低 token 成本。
 type PromptCompressConfig struct {
 	Enabled            bool `json:"enabled"`
 	MaxTotalChars      int  `json:"max_total_chars"`
@@ -123,6 +141,15 @@ func applyDefaults(c *Config) {
 	}
 	if c.Gateway.FailoverMaxTries == 0 {
 		c.Gateway.FailoverMaxTries = 3
+	}
+	if c.StickySession.TTLSec == 0 {
+		c.StickySession.TTLSec = 3600
+	}
+	if c.Concurrency.GlobalMax == 0 {
+		c.Concurrency.GlobalMax = 100
+	}
+	if c.Concurrency.PerAPIKeyMax == 0 {
+		c.Concurrency.PerAPIKeyMax = 10
 	}
 }
 

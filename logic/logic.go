@@ -10,10 +10,10 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"gateway/config"
+	"gateway/store"
 	"gateway/tools"
 
 	"github.com/sashabaranov/go-openai"
@@ -28,38 +28,35 @@ var DefaultTransport = &http.Transport{
 	DisableKeepAlives:   false,
 }
 
-type SimpleLoadBalancer struct {
-	instances []config.Api
-	counter   uint64
-}
-
-func NewSimpleLoadBalancer(instances []config.Api) *SimpleLoadBalancer {
-	return &SimpleLoadBalancer{instances: instances}
-}
-
-func (lb *SimpleLoadBalancer) Next() config.Api {
-	if len(lb.instances) == 0 {
-		return config.Api{}
-	}
-	n := atomic.AddUint64(&lb.counter, 1) % uint64(len(lb.instances))
-	return lb.instances[n]
-}
-
-func (lb *SimpleLoadBalancer) Len() int {
-	if lb == nil {
-		return 0
-	}
-	return len(lb.instances)
-}
-
 type ChatLogic struct {
 	ctx              context.Context
 	svcCtx           *tools.ServiceContext
 	lbByName         map[string]*SimpleLoadBalancer
 	limiters         map[string]*rate.Limiter
 	breakers         map[string]*gobreaker.CircuitBreaker
+	modelMap         map[string]config.ModelRoute
+	concurrency      *ConcurrencyGate
 	upstreamTimeout  time.Duration
 	failoverMaxTries int
+}
+
+type ChatParams struct {
+	ApiKey      string
+	SessionID   string
+	Model       string
+	Messages    []tools.Message
+	RoutingMode string
+	Stream      bool
+	MaxTokens   int
+	Temperature float32
+}
+
+func (p ChatParams) toRequest() *tools.Request {
+	return &tools.Request{
+		Model:       p.Model,
+		Messages:    p.Messages,
+		RoutingMode: p.RoutingMode,
+	}
 }
 
 func expandAPISpecs(apis []config.Api) []config.Api {
@@ -139,6 +136,8 @@ func NewChatLogic(ctx context.Context, svcCtx *tools.ServiceContext) *ChatLogic 
 		lbByName:         lbByName,
 		limiters:         limiters,
 		breakers:         breakers,
+		modelMap:         buildModelMap(svcCtx.Config.ModelMap),
+		concurrency:      NewConcurrencyGate(svcCtx.Config.Concurrency),
 		upstreamTimeout:  time.Duration(svcCtx.Config.Gateway.UpstreamTimeoutSec) * time.Second,
 		failoverMaxTries: maxTry,
 	}
@@ -194,24 +193,6 @@ func (l *ChatLogic) newUpstreamClient(apiCfg config.Api) *openai.Client {
 	return openai.NewClientWithConfig(cfg)
 }
 
-// ChatParams 网关内部统一聊天参数（OpenAI 与旧 /chat 共用）。
-type ChatParams struct {
-	Model       string
-	Messages    []tools.Message
-	RoutingMode string
-	Stream      bool
-	MaxTokens   int
-	Temperature float32
-}
-
-func (p ChatParams) toRequest() *tools.Request {
-	return &tools.Request{
-		Model:       p.Model,
-		Messages:    p.Messages,
-		RoutingMode: p.RoutingMode,
-	}
-}
-
 func (l *ChatLogic) buildOpenAIRequest(params ChatParams, model string, messages []tools.Message) openai.ChatCompletionRequest {
 	maxTokens := params.MaxTokens
 	if maxTokens <= 0 {
@@ -237,6 +218,11 @@ func (l *ChatLogic) buildOpenAIRequest(params ChatParams, model string, messages
 	}
 }
 
+type callResult struct {
+	resp        *openai.ChatCompletionResponse
+	instanceURL string
+}
+
 func (l *ChatLogic) callInstance(
 	ctx context.Context,
 	backendName string,
@@ -244,7 +230,7 @@ func (l *ChatLogic) callInstance(
 	params ChatParams,
 	model string,
 	messages []tools.Message,
-) (*openai.ChatCompletionResponse, error) {
+) (*callResult, error) {
 	if strings.TrimSpace(apiCfg.Url) == "" {
 		return nil, fmt.Errorf("backend %q has empty url", backendName)
 	}
@@ -273,7 +259,14 @@ func (l *ChatLogic) callInstance(
 	if err != nil {
 		return nil, err
 	}
-	return result.(*openai.ChatCompletionResponse), nil
+	return &callResult{resp: result.(*openai.ChatCompletionResponse), instanceURL: apiCfg.Url}, nil
+}
+
+type streamResult struct {
+	promptTokens     int
+	completionTokens int
+	totalTokens      int
+	instanceURL      string
 }
 
 func (l *ChatLogic) streamInstance(
@@ -284,19 +277,24 @@ func (l *ChatLogic) streamInstance(
 	model string,
 	messages []tools.Message,
 	w http.ResponseWriter,
-) error {
+) (*streamResult, error) {
 	if strings.TrimSpace(apiCfg.Url) == "" {
-		return fmt.Errorf("backend %q has empty url", backendName)
+		return nil, fmt.Errorf("backend %q has empty url", backendName)
 	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		return fmt.Errorf("streaming not supported")
+		return nil, fmt.Errorf("streaming not supported")
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+
+	var out streamResult
+	out.instanceURL = apiCfg.Url
+	promptEst := tools.EstimatePromptTokens(messages)
+	var completionBuf strings.Builder
 
 	breaker := l.getBreaker(backendName, apiCfg)
 	_, err := breaker.Execute(func() (interface{}, error) {
@@ -318,6 +316,14 @@ func (l *ChatLogic) streamInstance(
 			if err != nil {
 				return nil, err
 			}
+			if chunk.Usage != nil {
+				out.promptTokens = chunk.Usage.PromptTokens
+				out.completionTokens = chunk.Usage.CompletionTokens
+				out.totalTokens = chunk.Usage.TotalTokens
+			}
+			for _, ch := range chunk.Choices {
+				completionBuf.WriteString(ch.Delta.Content)
+			}
 			data, err := json.Marshal(chunk)
 			if err != nil {
 				return nil, err
@@ -333,16 +339,29 @@ func (l *ChatLogic) streamInstance(
 		flusher.Flush()
 		return nil, nil
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	if out.promptTokens == 0 {
+		out.promptTokens = promptEst
+	}
+	if out.completionTokens == 0 {
+		out.completionTokens = tools.EstimateCompletionTokens(completionBuf.String())
+	}
+	if out.totalTokens == 0 {
+		out.totalTokens = out.promptTokens + out.completionTokens
+	}
+	return &out, nil
 }
 
 func (l *ChatLogic) callBackendWithFailover(
 	ctx context.Context,
 	backendName string,
+	sessionKey string,
 	params ChatParams,
 	model string,
 	messages []tools.Message,
-) (*openai.ChatCompletionResponse, error) {
+) (*callResult, error) {
 	lb, ok := l.lbByName[backendName]
 	if !ok || lb.Len() == 0 {
 		return nil, fmt.Errorf("backend %q not configured", backendName)
@@ -355,12 +374,15 @@ func (l *ChatLogic) callBackendWithFailover(
 
 	var lastErr error
 	for i := 0; i < tries; i++ {
-		apiCfg := lb.Next()
-		resp, err := l.callInstance(ctx, backendName, apiCfg, params, model, messages)
+		apiCfg := lb.Pick(ctx, l.svcCtx.Sticky, backendName, sessionKey)
+		res, err := l.callInstance(ctx, backendName, apiCfg, params, model, messages)
 		if err == nil {
-			return resp, nil
+			return res, nil
 		}
 		lastErr = err
+		if sessionKey != "" {
+			l.svcCtx.Sticky.Delete(ctx, backendName, sessionKey)
+		}
 		if !isRetryableUpstreamErr(err) {
 			break
 		}
@@ -372,14 +394,15 @@ func (l *ChatLogic) callBackendWithFailover(
 func (l *ChatLogic) streamBackendWithFailover(
 	ctx context.Context,
 	backendName string,
+	sessionKey string,
 	params ChatParams,
 	model string,
 	messages []tools.Message,
 	w http.ResponseWriter,
-) error {
+) (*streamResult, error) {
 	lb, ok := l.lbByName[backendName]
 	if !ok || lb.Len() == 0 {
-		return fmt.Errorf("backend %q not configured", backendName)
+		return nil, fmt.Errorf("backend %q not configured", backendName)
 	}
 
 	tries := l.failoverMaxTries
@@ -389,28 +412,32 @@ func (l *ChatLogic) streamBackendWithFailover(
 
 	var lastErr error
 	for i := 0; i < tries; i++ {
-		apiCfg := lb.Next()
-		err := l.streamInstance(ctx, backendName, apiCfg, params, model, messages, w)
+		apiCfg := lb.Pick(ctx, l.svcCtx.Sticky, backendName, sessionKey)
+		res, err := l.streamInstance(ctx, backendName, apiCfg, params, model, messages, w)
 		if err == nil {
-			return nil
+			return res, nil
 		}
 		lastErr = err
+		if sessionKey != "" {
+			l.svcCtx.Sticky.Delete(ctx, backendName, sessionKey)
+		}
 		if !isRetryableUpstreamErr(err) {
 			break
 		}
 		log.Printf("stream failover: backend=%s try=%d/%d err=%v", backendName, i+1, tries, err)
 	}
-	return lastErr
+	return nil, lastErr
 }
 
-func (l *ChatLogic) prepareChat(params ChatParams) (routeDecision, []tools.Message, error) {
+func (l *ChatLogic) prepareChat(params ChatParams) (routeDecision, []tools.Message, string, error) {
 	route, err := l.resolveRoute(params.toRequest())
 	if err != nil {
-		return routeDecision{}, nil, err
+		return routeDecision{}, nil, "", err
 	}
 	pc := l.effectivePromptCompress()
 	msgs := CompressMessages(params.Messages, pc)
-	return route, msgs, nil
+	sk := sessionKeyFromParams(params)
+	return route, msgs, sk, nil
 }
 
 func (l *ChatLogic) checkRateLimit(route routeDecision) error {
@@ -425,9 +452,35 @@ func (l *ChatLogic) checkRateLimit(route routeDecision) error {
 	return nil
 }
 
-// ChatCompletion OpenAI 兼容入口：支持流式与非流式。
+func (l *ChatLogic) recordUsage(params ChatParams, route routeDecision, instanceURL string, prompt, completion, total int, stream bool, latency time.Duration, status string) {
+	if l.svcCtx.Usage == nil {
+		return
+	}
+	l.svcCtx.Usage.Record(context.Background(), store.UsageRecord{
+		ApiKey:           params.ApiKey,
+		ClientModel:      route.ClientModel,
+		RoutedModel:      route.Model,
+		Backend:          route.Backend,
+		InstanceURL:      instanceURL,
+		PromptTokens:     prompt,
+		CompletionTokens: completion,
+		TotalTokens:      total,
+		Economy:          route.Economy,
+		Stream:           stream,
+		LatencyMs:        latency.Milliseconds(),
+		Status:           status,
+	})
+}
+
 func (l *ChatLogic) ChatCompletion(ctx context.Context, w http.ResponseWriter, params ChatParams) error {
-	route, msgs, err := l.prepareChat(params)
+	release, err := l.concurrency.Acquire(params.ApiKey)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	start := time.Now()
+	route, msgs, sessionKey, err := l.prepareChat(params)
 	if err != nil {
 		return err
 	}
@@ -436,34 +489,50 @@ func (l *ChatLogic) ChatCompletion(ctx context.Context, w http.ResponseWriter, p
 	}
 
 	if params.Stream {
-		err = l.streamBackendWithFailover(ctx, route.Backend, params, route.Model, msgs, w)
+		sr, err := l.streamBackendWithFailover(ctx, route.Backend, sessionKey, params, route.Model, msgs, w)
+		if err != nil {
+			l.recordUsage(params, route, "", tools.EstimatePromptTokens(msgs), 0, 0, true, time.Since(start), "error")
+			log.Printf("ChatCompletion failed: %v", err)
+			return fmt.Errorf("backend call failed: %w", err)
+		}
+		l.recordUsage(params, route, sr.instanceURL, sr.promptTokens, sr.completionTokens, sr.totalTokens, true, time.Since(start), "ok")
 	} else {
-		var resp *openai.ChatCompletionResponse
-		resp, err = l.callBackendWithFailover(ctx, route.Backend, params, route.Model, msgs)
-		if err == nil {
-			w.Header().Set("Content-Type", "application/json")
-			err = json.NewEncoder(w).Encode(resp)
+		res, err := l.callBackendWithFailover(ctx, route.Backend, sessionKey, params, route.Model, msgs)
+		if err != nil {
+			l.recordUsage(params, route, "", tools.EstimatePromptTokens(msgs), 0, 0, false, time.Since(start), "error")
+			log.Printf("ChatCompletion failed: %v", err)
+			return fmt.Errorf("backend call failed: %w", err)
+		}
+		p, c, t := tools.UsageFromResponse(res.resp)
+		l.recordUsage(params, route, res.instanceURL, p, c, t, false, time.Since(start), "ok")
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(res.resp); err != nil {
+			return err
 		}
 	}
-	if err != nil {
-		log.Printf("ChatCompletion failed: %v", err)
-		return fmt.Errorf("backend call failed: %w", err)
-	}
 
-	log.Printf("Chat: backend=%s economy=%t routed_model=%s client_model=%s stream=%t",
-		route.Backend, route.Economy, route.Model, params.Model, params.Stream)
+	log.Printf("Chat: backend=%s economy=%t routed_model=%s client_model=%s stream=%t session=%t",
+		route.Backend, route.Economy, route.Model, params.Model, params.Stream, sessionKey != "")
 	return nil
 }
 
-// Chat 保留旧 JSON 协议（非流式）。
 func (l *ChatLogic) Chat(req *tools.Request) (*tools.Response, error) {
 	params := ChatParams{
+		ApiKey:      req.ApiKey,
 		Model:       req.Model,
 		Messages:    req.Messages,
 		RoutingMode: req.RoutingMode,
 		Stream:      false,
 	}
-	route, msgs, err := l.prepareChat(params)
+
+	release, err := l.concurrency.Acquire(params.ApiKey)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	start := time.Now()
+	route, msgs, sessionKey, err := l.prepareChat(params)
 	if err != nil {
 		return nil, err
 	}
@@ -483,21 +552,25 @@ func (l *ChatLogic) Chat(req *tools.Request) (*tools.Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	resp, err := l.callBackendWithFailover(ctx, route.Backend, params, route.Model, msgs)
+	res, err := l.callBackendWithFailover(ctx, route.Backend, sessionKey, params, route.Model, msgs)
 	if err != nil {
+		l.recordUsage(params, route, "", tools.EstimatePromptTokens(msgs), 0, 0, false, time.Since(start), "error")
 		return nil, fmt.Errorf("backend call failed: %w", err)
 	}
 
+	p, c, t := tools.UsageFromResponse(res.resp)
+	l.recordUsage(params, route, res.instanceURL, p, c, t, false, time.Since(start), "ok")
+
 	out := &tools.Response{
-		Id:     resp.ID,
-		Object: resp.Object,
+		Id:     res.resp.ID,
+		Object: res.resp.Object,
 		Choices: []tools.Choice{{
 			Index: 0,
 			Message: tools.Message{
-				Role:    resp.Choices[0].Message.Role,
-				Content: resp.Choices[0].Message.Content,
+				Role:    res.resp.Choices[0].Message.Role,
+				Content: res.resp.Choices[0].Message.Content,
 			},
-			FinishReason: string(resp.Choices[0].FinishReason),
+			FinishReason: string(res.resp.Choices[0].FinishReason),
 		}},
 	}
 	log.Printf("Chat: backend=%s economy=%t routed_model=%s client_model=%s resp_id=%s",

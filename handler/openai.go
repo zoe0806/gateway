@@ -52,7 +52,12 @@ func (h *OpenAIHandler) ChatCompletions(c *gin.Context) {
 	serCtx := c.MustGet("svc_ctx").(*tools.ServiceContext)
 	chatLogic := logic.NewChatLogic(c.Request.Context(), serCtx)
 
+	apiKey, _ := c.Get("api_key")
+	keyStr, _ := apiKey.(string)
+
 	params := logic.ChatParams{
+		ApiKey:      keyStr,
+		SessionID:   c.GetHeader("X-Session-Id"),
 		Model:       req.Model,
 		Messages:    messages,
 		RoutingMode: c.GetHeader("X-Routing-Mode"),
@@ -62,7 +67,7 @@ func (h *OpenAIHandler) ChatCompletions(c *gin.Context) {
 	}
 
 	if err := chatLogic.ChatCompletion(c.Request.Context(), c.Writer, params); err != nil {
-		if strings.Contains(err.Error(), "rate limit") {
+		if strings.Contains(err.Error(), "concurrency") || strings.Contains(err.Error(), "rate limit") {
 			c.JSON(http.StatusTooManyRequests, gin.H{
 				"error": gin.H{
 					"message": err.Error(),

@@ -38,12 +38,14 @@ func main() {
 	})
 
 	openaiH := handler.NewOpenAIHandler()
+	usageH := handler.NewUsageHandler()
 	authMW := auth.APIKeyAuth(serCtx.Auth)
 
 	v1 := router.Group("/v1")
 	v1.Use(authMW)
 	{
 		v1.POST("/chat/completions", openaiH.ChatCompletions)
+		v1.GET("/usage/summary", usageH.Summary)
 	}
 
 	// 兼容旧协议；鉴权：Authorization Bearer 优先，否则 body.api_key

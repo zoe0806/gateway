@@ -9,9 +9,10 @@ import (
 )
 
 type routeDecision struct {
-	Backend string
-	Model   string
-	Economy bool
+	Backend     string
+	Model       string // 发往上游的 model
+	ClientModel string
+	Economy     bool
 }
 
 func (l *ChatLogic) effectiveRouting() config.RoutingConfig {
@@ -54,45 +55,63 @@ func (l *ChatLogic) effectivePromptCompress() config.PromptCompressConfig {
 	return p
 }
 
+func (l *ChatLogic) finishRoute(clientModel, backend string, economy bool) (routeDecision, error) {
+	routed := clientModel
+	if economy {
+		r := l.effectiveRouting()
+		backend = r.EconomyBackend
+		routed = r.EconomyModel
+	}
+	upstream := l.upstreamModel(clientModel, routed)
+	return routeDecision{
+		Backend:     backend,
+		Model:       upstream,
+		ClientModel: clientModel,
+		Economy:     economy,
+	}, nil
+}
+
 func (l *ChatLogic) resolveRoute(req *tools.Request) (routeDecision, error) {
+	clientModel := req.Model
 	mode := strings.ToLower(strings.TrimSpace(req.RoutingMode))
 	if mode == "" {
 		mode = "auto"
 	}
 
 	r := l.effectiveRouting()
-	if !r.Enabled || mode == "premium" {
-		b, err := l.selectBackend(req.Model)
-		if err != nil {
-			return routeDecision{}, err
-		}
-		return routeDecision{Backend: b, Model: req.Model, Economy: false}, nil
-	}
 
 	if mode == "economy" {
 		if !l.hasBackend(r.EconomyBackend) {
 			return routeDecision{}, fmt.Errorf("economy backend %q not in apis config", r.EconomyBackend)
 		}
-		return routeDecision{Backend: r.EconomyBackend, Model: r.EconomyModel, Economy: true}, nil
+		return l.finishRoute(clientModel, r.EconomyBackend, true)
+	}
+
+	if !r.Enabled || mode == "premium" {
+		b, err := l.backendForModel(clientModel)
+		if err != nil {
+			return routeDecision{}, err
+		}
+		return l.finishRoute(clientModel, b, false)
 	}
 
 	// auto
 	if isComplexTask(req.Messages, r) {
-		b, err := l.selectBackend(req.Model)
+		b, err := l.backendForModel(clientModel)
 		if err != nil {
 			return routeDecision{}, err
 		}
-		return routeDecision{Backend: b, Model: req.Model, Economy: false}, nil
+		return l.finishRoute(clientModel, b, false)
 	}
 
 	if !l.hasBackend(r.EconomyBackend) {
-		b, err := l.selectBackend(req.Model)
+		b, err := l.backendForModel(clientModel)
 		if err != nil {
 			return routeDecision{}, err
 		}
-		return routeDecision{Backend: b, Model: req.Model, Economy: false}, nil
+		return l.finishRoute(clientModel, b, false)
 	}
-	return routeDecision{Backend: r.EconomyBackend, Model: r.EconomyModel, Economy: true}, nil
+	return l.finishRoute(clientModel, r.EconomyBackend, true)
 }
 
 func isComplexTask(messages []tools.Message, r config.RoutingConfig) bool {
@@ -119,4 +138,16 @@ func isComplexTask(messages []tools.Message, r config.RoutingConfig) bool {
 		}
 	}
 	return false
+}
+
+func sessionKeyFromParams(params ChatParams) string {
+	if strings.TrimSpace(params.SessionID) != "" {
+		return strings.TrimSpace(params.SessionID)
+	}
+	for _, m := range params.Messages {
+		if strings.EqualFold(m.Role, "user") && m.Content != "" {
+			return tools.HashSession(m.Content)
+		}
+	}
+	return ""
 }
