@@ -1,79 +1,50 @@
 package tools
 
 import (
-	"fmt"
+	"context"
 	"log"
-	"os"
-	"strings"
 
+	"gateway/auth"
 	"gateway/config"
+	"gateway/store"
 
-	consulapi "github.com/hashicorp/consul/api"
+	"github.com/redis/go-redis/v9"
+	"gorm.io/gorm"
 )
 
 type ServiceContext struct {
-	Config       config.Config
-	ConsulClient *consulapi.Client
-	consulSvcID  string // 非空表示已成功向本机 Agent 注册，退出时应注销
-}
-
-func sanitizeConsulIDPart(s string) string {
-	return strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
-			return r
-		default:
-			return '-'
-		}
-	}, s)
+	Config config.Config
+	DB     *gorm.DB
+	Redis  *redis.Client
+	Auth   *auth.Authenticator
 }
 
 func NewServiceContext(c config.Config) *ServiceContext {
-	consulConfig := consulapi.DefaultConfig()
-	consulConfig.Address = c.Consul.Host
-
-	consulClient, err := consulapi.NewClient(consulConfig)
+	db, err := store.NewMySQL(c.MySQL)
 	if err != nil {
-		log.Printf("consul: new client: %v (registration disabled)", err)
-		return &ServiceContext{Config: c, ConsulClient: nil}
+		log.Fatalf("mysql: %v", err)
 	}
 
-	host, _ := os.Hostname()
-	svcID := fmt.Sprintf("%s-%s-%d", sanitizeConsulIDPart(c.Consul.Key), sanitizeConsulIDPart(host), c.Port)
-
-	registration := &consulapi.AgentServiceRegistration{
-		ID:      svcID,
-		Name:    c.Consul.Key,
-		Port:    c.Port,
-		Address: c.Host,
-		Check: &consulapi.AgentServiceCheck{
-			HTTP:     fmt.Sprintf("http://%s:%d/health", c.Host, c.Port),
-			Interval: "10s",
-			Timeout:  "5s",
-		},
+	rdb, err := store.NewRedis(c.Redis)
+	if err != nil {
+		log.Fatalf("redis: %v", err)
 	}
-	if err := consulClient.Agent().ServiceRegister(registration); err != nil {
-		log.Printf("consul: service register %q: %v", svcID, err)
-		svcID = ""
-	} else {
-		log.Printf("consul: registered service id=%q name=%q", svcID, c.Consul.Key)
+
+	authenticator := auth.NewAuthenticator(db, rdb, c.Redis)
+	if err := authenticator.WarmCache(context.Background()); err != nil {
+		log.Fatalf("auth warm cache: %v", err)
 	}
 
 	return &ServiceContext{
-		Config:       c,
-		ConsulClient: consulClient,
-		consulSvcID:  svcID,
+		Config: c,
+		DB:     db,
+		Redis:  rdb,
+		Auth:   authenticator,
 	}
 }
 
-// DeregisterFromConsul 在进程退出前注销，避免 Consul 中长期残留不健康实例。
-func (s *ServiceContext) DeregisterFromConsul() {
-	if s == nil || s.ConsulClient == nil || s.consulSvcID == "" {
-		return
+func (s *ServiceContext) Close() {
+	if s.Redis != nil {
+		_ = s.Redis.Close()
 	}
-	if err := s.ConsulClient.Agent().ServiceDeregister(s.consulSvcID); err != nil {
-		log.Printf("consul: service deregister %q: %v", s.consulSvcID, err)
-		return
-	}
-	log.Printf("consul: deregistered service id=%q", s.consulSvcID)
 }

@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"gateway/auth"
 	"gateway/config"
+	"gateway/handler"
 	"gateway/logic"
 	"gateway/tools"
 	"log"
@@ -19,6 +21,7 @@ import (
 func main() {
 	cfg := config.Load()
 	serCtx := tools.NewServiceContext(*cfg)
+	defer serCtx.Close()
 
 	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -26,19 +29,32 @@ func main() {
 	router := gin.Default()
 	gin.SetMode(cfg.Mode)
 
+	router.Use(func(c *gin.Context) {
+		c.Set("svc_ctx", serCtx)
+	})
+
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	router.POST("/chat", func(c *gin.Context) {
+	openaiH := handler.NewOpenAIHandler()
+	authMW := auth.APIKeyAuth(serCtx.Auth)
+
+	v1 := router.Group("/v1")
+	v1.Use(authMW)
+	{
+		v1.POST("/chat/completions", openaiH.ChatCompletions)
+	}
+
+	// 兼容旧协议；鉴权：Authorization Bearer 优先，否则 body.api_key
+	router.POST("/chat", authMW, func(c *gin.Context) {
 		var req tools.Request
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		if !tools.IsAllowedApiKey(req.ApiKey) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-			return
+		if key, ok := c.Get("api_key"); ok {
+			req.ApiKey = key.(string)
 		}
 		chatLogic := logic.NewChatLogic(c.Request.Context(), serCtx)
 		resp, err := chatLogic.Chat(&req)
@@ -51,11 +67,15 @@ func main() {
 
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	log.Printf("listening on %s", addr)
+
+	readTO := time.Duration(cfg.Gateway.ReadTimeoutSec) * time.Second
+	writeTO := time.Duration(cfg.Gateway.WriteTimeoutSec) * time.Second
+
 	srv := &http.Server{
 		Addr:           addr,
 		Handler:        router,
-		ReadTimeout:    5 * time.Second,
-		WriteTimeout:   60 * time.Second,
+		ReadTimeout:    readTO,
+		WriteTimeout:   writeTO,
 		IdleTimeout:    120 * time.Second,
 		MaxHeaderBytes: 1 << 20,
 	}
@@ -72,5 +92,4 @@ func main() {
 	if err := srv.Shutdown(shCtx); err != nil {
 		log.Printf("server shutdown: %v", err)
 	}
-	serCtx.DeregisterFromConsul()
 }

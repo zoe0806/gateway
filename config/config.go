@@ -9,16 +9,37 @@ import (
 )
 
 type Config struct {
-	Consul struct {
-		Host string `json:"host"`
-		Key  string `json:"key"`
-	} `json:"consul"`
-	Port           int                 `json:"port"`
-	Host           string              `json:"host"`
-	Mode           string              `json:"mode"`
-	Apis           []Api               `json:"apis"`
-	Routing        RoutingConfig       `json:"routing"`
+	Port           int                  `json:"port"`
+	Mode           string               `json:"mode"`
+	Apis           []Api                `json:"apis"`
+	Routing        RoutingConfig        `json:"routing"`
 	PromptCompress PromptCompressConfig `json:"prompt_compress"`
+	MySQL          MySQLConfig          `json:"mysql"`
+	Redis          RedisConfig          `json:"redis"`
+	Gateway        GatewayConfig        `json:"gateway"`
+}
+
+type MySQLConfig struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	User     string `json:"user"`
+	Password string `json:"password"`
+	Database string `json:"database"`
+}
+
+type RedisConfig struct {
+	Addr             string `json:"addr"`
+	Password         string `json:"password"`
+	DB               int    `json:"db"`
+	APIKeyCacheTTL   int    `json:"api_key_cache_ttl_sec"`
+}
+
+type GatewayConfig struct {
+	ReadTimeoutSec     int `json:"read_timeout_sec"`
+	WriteTimeoutSec    int `json:"write_timeout_sec"`
+	UpstreamTimeoutSec int `json:"upstream_timeout_sec"`
+	MaxBodyBytes       int `json:"max_body_bytes"`
+	FailoverMaxTries   int `json:"failover_max_tries"`
 }
 
 // RoutingConfig 智能模型路由：简单对话走经济模型，复杂任务保留客户端指定模型。
@@ -42,7 +63,7 @@ type PromptCompressConfig struct {
 type Api struct {
 	Name   string   `json:"name"`
 	Url    string   `json:"url"`
-	Urls   []string `json:"urls,omitempty"` // 与 url 二选一或并存：展开为多个实例（同一 name 多地址）
+	Urls   []string `json:"urls,omitempty"`
 	ApiKey string   `json:"api_key"`
 }
 
@@ -65,7 +86,44 @@ func init() {
 		if err != nil {
 			log.Fatalf("unmarshal config: %v", err)
 		}
+		applyDefaults(&config)
 	})
+}
+
+func applyDefaults(c *Config) {
+	if c.MySQL.Host == "" {
+		c.MySQL.Host = "127.0.0.1"
+	}
+	if c.MySQL.Port == 0 {
+		c.MySQL.Port = 3306
+	}
+	if c.MySQL.User == "" {
+		c.MySQL.User = "root"
+	}
+	if c.MySQL.Database == "" {
+		c.MySQL.Database = "test"
+	}
+	if c.Redis.Addr == "" {
+		c.Redis.Addr = "127.0.0.1:6379"
+	}
+	if c.Redis.APIKeyCacheTTL == 0 {
+		c.Redis.APIKeyCacheTTL = 300
+	}
+	if c.Gateway.ReadTimeoutSec == 0 {
+		c.Gateway.ReadTimeoutSec = 30
+	}
+	if c.Gateway.WriteTimeoutSec == 0 {
+		c.Gateway.WriteTimeoutSec = 300
+	}
+	if c.Gateway.UpstreamTimeoutSec == 0 {
+		c.Gateway.UpstreamTimeoutSec = 180
+	}
+	if c.Gateway.MaxBodyBytes == 0 {
+		c.Gateway.MaxBodyBytes = 10 << 20
+	}
+	if c.Gateway.FailoverMaxTries == 0 {
+		c.Gateway.FailoverMaxTries = 3
+	}
 }
 
 func Load() *Config {
