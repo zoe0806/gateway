@@ -6,7 +6,6 @@ import (
 	"gateway/auth"
 	"gateway/config"
 	"gateway/handler"
-	"gateway/logic"
 	"gateway/tools"
 	"log"
 	"net/http"
@@ -37,35 +36,12 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	openaiH := handler.NewOpenAIHandler()
+	chatH := handler.NewChatHandler()
 	usageH := handler.NewUsageHandler()
 	authMW := auth.APIKeyAuth(serCtx.Auth)
 
-	v1 := router.Group("/v1")
-	v1.Use(authMW)
-	{
-		v1.POST("/chat/completions", openaiH.ChatCompletions)
-		v1.GET("/usage/summary", usageH.Summary)
-	}
-
-	// 兼容旧协议；鉴权：Authorization Bearer 优先，否则 body.api_key
-	router.POST("/chat", authMW, func(c *gin.Context) {
-		var req tools.Request
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-		if key, ok := c.Get("api_key"); ok {
-			req.ApiKey = key.(string)
-		}
-		chatLogic := logic.NewChatLogic(c.Request.Context(), serCtx)
-		resp, err := chatLogic.Chat(&req)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, resp)
-	})
+	router.POST("/chat", authMW, chatH.Chat)
+	router.GET("/usage", authMW, usageH.Summary)
 
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	log.Printf("listening on %s", addr)

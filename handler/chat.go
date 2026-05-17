@@ -11,13 +11,14 @@ import (
 	"github.com/sashabaranov/go-openai"
 )
 
-type OpenAIHandler struct{}
+type ChatHandler struct{}
 
-func NewOpenAIHandler() *OpenAIHandler {
-	return &OpenAIHandler{}
+func NewChatHandler() *ChatHandler {
+	return &ChatHandler{}
 }
 
-func (h *OpenAIHandler) ChatCompletions(c *gin.Context) {
+// Chat POST /chat — OpenAI Chat Completions 兼容（支持 stream）。
+func (h *ChatHandler) Chat(c *gin.Context) {
 	var req openai.ChatCompletionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -66,7 +67,7 @@ func (h *OpenAIHandler) ChatCompletions(c *gin.Context) {
 		Temperature: req.Temperature,
 	}
 
-	if err := chatLogic.ChatCompletion(c.Request.Context(), c.Writer, params); err != nil {
+	if err := chatLogic.Chat(c.Request.Context(), c.Writer, params); err != nil {
 		if strings.Contains(err.Error(), "concurrency") || strings.Contains(err.Error(), "rate limit") {
 			c.JSON(http.StatusTooManyRequests, gin.H{
 				"error": gin.H{
@@ -77,7 +78,6 @@ func (h *OpenAIHandler) ChatCompletions(c *gin.Context) {
 			return
 		}
 		if params.Stream {
-			// 流式可能已写入部分数据，仅在没有写入时返回 JSON 错误
 			if c.Writer.Size() <= 0 {
 				c.JSON(http.StatusBadGateway, gin.H{
 					"error": gin.H{

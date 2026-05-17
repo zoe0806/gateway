@@ -71,9 +71,9 @@ func (l *ChatLogic) finishRoute(clientModel, backend string, economy bool) (rout
 	}, nil
 }
 
-func (l *ChatLogic) resolveRoute(req *tools.Request) (routeDecision, error) {
-	clientModel := req.Model
-	mode := strings.ToLower(strings.TrimSpace(req.RoutingMode))
+func (l *ChatLogic) resolveRoute(model, routingMode string, messages []tools.Message) (routeDecision, error) {
+	clientModel := model
+	mode := strings.ToLower(strings.TrimSpace(routingMode))
 	if mode == "" {
 		mode = "auto"
 	}
@@ -96,7 +96,7 @@ func (l *ChatLogic) resolveRoute(req *tools.Request) (routeDecision, error) {
 	}
 
 	// auto
-	if isComplexTask(req.Messages, r) {
+	if isComplexTask(messages, r) {
 		b, err := l.backendForModel(clientModel)
 		if err != nil {
 			return routeDecision{}, err

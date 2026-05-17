@@ -51,14 +51,6 @@ type ChatParams struct {
 	Temperature float32
 }
 
-func (p ChatParams) toRequest() *tools.Request {
-	return &tools.Request{
-		Model:       p.Model,
-		Messages:    p.Messages,
-		RoutingMode: p.RoutingMode,
-	}
-}
-
 func expandAPISpecs(apis []config.Api) []config.Api {
 	var out []config.Api
 	for _, a := range apis {
@@ -430,7 +422,7 @@ func (l *ChatLogic) streamBackendWithFailover(
 }
 
 func (l *ChatLogic) prepareChat(params ChatParams) (routeDecision, []tools.Message, string, error) {
-	route, err := l.resolveRoute(params.toRequest())
+	route, err := l.resolveRoute(params.Model, params.RoutingMode, params.Messages)
 	if err != nil {
 		return routeDecision{}, nil, "", err
 	}
@@ -472,7 +464,7 @@ func (l *ChatLogic) recordUsage(params ChatParams, route routeDecision, instance
 	})
 }
 
-func (l *ChatLogic) ChatCompletion(ctx context.Context, w http.ResponseWriter, params ChatParams) error {
+func (l *ChatLogic) Chat(ctx context.Context, w http.ResponseWriter, params ChatParams) error {
 	release, err := l.concurrency.Acquire(params.ApiKey)
 	if err != nil {
 		return err
@@ -492,7 +484,7 @@ func (l *ChatLogic) ChatCompletion(ctx context.Context, w http.ResponseWriter, p
 		sr, err := l.streamBackendWithFailover(ctx, route.Backend, sessionKey, params, route.Model, msgs, w)
 		if err != nil {
 			l.recordUsage(params, route, "", tools.EstimatePromptTokens(msgs), 0, 0, true, time.Since(start), "error")
-			log.Printf("ChatCompletion failed: %v", err)
+			log.Printf("chat failed: %v", err)
 			return fmt.Errorf("backend call failed: %w", err)
 		}
 		l.recordUsage(params, route, sr.instanceURL, sr.promptTokens, sr.completionTokens, sr.totalTokens, true, time.Since(start), "ok")
@@ -500,7 +492,7 @@ func (l *ChatLogic) ChatCompletion(ctx context.Context, w http.ResponseWriter, p
 		res, err := l.callBackendWithFailover(ctx, route.Backend, sessionKey, params, route.Model, msgs)
 		if err != nil {
 			l.recordUsage(params, route, "", tools.EstimatePromptTokens(msgs), 0, 0, false, time.Since(start), "error")
-			log.Printf("ChatCompletion failed: %v", err)
+			log.Printf("chat failed: %v", err)
 			return fmt.Errorf("backend call failed: %w", err)
 		}
 		p, c, t := tools.UsageFromResponse(res.resp)
@@ -514,68 +506,6 @@ func (l *ChatLogic) ChatCompletion(ctx context.Context, w http.ResponseWriter, p
 	log.Printf("Chat: backend=%s economy=%t routed_model=%s client_model=%s stream=%t session=%t",
 		route.Backend, route.Economy, route.Model, params.Model, params.Stream, sessionKey != "")
 	return nil
-}
-
-func (l *ChatLogic) Chat(req *tools.Request) (*tools.Response, error) {
-	params := ChatParams{
-		ApiKey:      req.ApiKey,
-		Model:       req.Model,
-		Messages:    req.Messages,
-		RoutingMode: req.RoutingMode,
-		Stream:      false,
-	}
-
-	release, err := l.concurrency.Acquire(params.ApiKey)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
-
-	start := time.Now()
-	route, msgs, sessionKey, err := l.prepareChat(params)
-	if err != nil {
-		return nil, err
-	}
-	if err := l.checkRateLimit(route); err != nil {
-		return &tools.Response{
-			Id:     "fallback",
-			Object: "error",
-			Choices: []tools.Choice{{
-				Index:        0,
-				Message:      tools.Message{Role: "assistant", Content: "当前请求过多，请稍后再试。"},
-				FinishReason: "rate_limit",
-			}},
-		}, nil
-	}
-
-	ctx := l.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	res, err := l.callBackendWithFailover(ctx, route.Backend, sessionKey, params, route.Model, msgs)
-	if err != nil {
-		l.recordUsage(params, route, "", tools.EstimatePromptTokens(msgs), 0, 0, false, time.Since(start), "error")
-		return nil, fmt.Errorf("backend call failed: %w", err)
-	}
-
-	p, c, t := tools.UsageFromResponse(res.resp)
-	l.recordUsage(params, route, res.instanceURL, p, c, t, false, time.Since(start), "ok")
-
-	out := &tools.Response{
-		Id:     res.resp.ID,
-		Object: res.resp.Object,
-		Choices: []tools.Choice{{
-			Index: 0,
-			Message: tools.Message{
-				Role:    res.resp.Choices[0].Message.Role,
-				Content: res.resp.Choices[0].Message.Content,
-			},
-			FinishReason: string(res.resp.Choices[0].FinishReason),
-		}},
-	}
-	log.Printf("Chat: backend=%s economy=%t routed_model=%s client_model=%s resp_id=%s",
-		route.Backend, route.Economy, route.Model, req.Model, out.Id)
-	return out, nil
 }
 
 func isRetryableUpstreamErr(err error) bool {

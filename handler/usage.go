@@ -17,7 +17,7 @@ func NewUsageHandler() *UsageHandler {
 	return &UsageHandler{}
 }
 
-// Summary GET /v1/usage/summary?days=7  返回当前 API Key 的用量汇总（供 HTML/JS 调用）。
+// Summary GET /usage/summary?days=7  返回当前 API Key 的用量汇总（供 HTML/JS 调用）。
 func (h *UsageHandler) Summary(c *gin.Context) {
 	serCtx := c.MustGet("svc_ctx").(*tools.ServiceContext)
 	apiKey, _ := c.Get("api_key")
