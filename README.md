@@ -214,4 +214,4 @@ curl "http://127.0.0.1:8080/usage/summary?days=7" \
 
 ## 许可证
 
-按仓库根目录约定使用（未单独声明时请自行补充 LICENSE）。
+MIT LICENSE
